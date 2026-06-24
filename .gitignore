@@ -1,0 +1,11 @@
+# Build artifacts
+.build/
+.swiftpm/
+SimpleMounter.app/
+
+# Icon intermediate — regenerate with:
+#   swift makeicon.swift && iconutil -c icns AppIcon.iconset -o AppIcon.icns
+AppIcon.iconset/
+
+# macOS
+.DS_Store
