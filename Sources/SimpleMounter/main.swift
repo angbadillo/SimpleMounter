@@ -55,9 +55,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let remotes = rclone.listRemotes()
         let mountedCount = remotes.filter { rclone.isMounted($0.name) }.count
 
-        let header = NSMenuItem(title: mountedCount > 0 ? "SimpleMounter — \(mountedCount) mounted"
-                                                        : "SimpleMounter",
-                                action: nil, keyEquivalent: "")
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        let title = "SimpleMounter \(version)" + (mountedCount > 0 ? " — \(mountedCount) mounted" : "")
+        let header = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
         menu.addItem(.separator())

@@ -27,8 +27,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleName</key>              <string>SimpleMounter</string>
     <key>CFBundleDisplayName</key>       <string>SimpleMounter</string>
     <key>CFBundleIdentifier</key>        <string>local.simplemounter</string>
-    <key>CFBundleVersion</key>           <string>1.0</string>
-    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key>           <string>0.0624</string>
+    <key>CFBundleShortVersionString</key><string>0.0624</string>
     <key>CFBundlePackageType</key>       <string>APPL</string>
     <key>CFBundleExecutable</key>        <string>SimpleMounter</string>
     <key>CFBundleIconFile</key>          <string>AppIcon</string>
