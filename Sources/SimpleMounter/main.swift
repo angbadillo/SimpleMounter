@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory)
         installMainMenu()   // habilita ⌘C/⌘V/⌘X en los campos de texto
         rclone.setupNotifications()
+        rclone.startWatchdog()   // re-monta automáticamente las conexiones que se caigan
         rclone.onChange = { [weak self] in self?.refreshStatusIcon() }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -92,7 +93,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func remoteItem(_ r: Remote) -> NSMenuItem {
         let mounted = rclone.isMounted(r.name)
         let busy = rclone.isBusy(r.name)
-        let status: String = busy ? "connecting…" : (mounted ? rclone.mountPoint(for: r.name).path : "not mounted")
+        var status: String = busy ? "connecting…" : (mounted ? rclone.mountPoint(for: r.name).path : "not mounted")
+        if mounted, let free = rclone.freeSpace(r.name) { status += " · \(free)" }
 
         let item = NSMenuItem()
         item.attributedTitle = twoLineTitle(name: r.name, subtitle: "\(r.prettyType) · \(status)")

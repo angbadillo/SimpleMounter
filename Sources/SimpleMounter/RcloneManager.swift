@@ -29,6 +29,17 @@ final class RcloneManager {
     /// Conexiones en transición (montando o autenticando) para mostrar "conectando…".
     private(set) var inProgress: Set<String> = []
 
+    // Auto-reintento: conexiones que el usuario quiere montadas, las que llegaron a montarse,
+    // y cuántos reintentos llevan tras una caída.
+    private var desiredMounted: Set<String> = []
+    private var established: Set<String> = []
+    private var retryCount: [String: Int] = [:]
+    private var watchdog: Timer?
+
+    /// Espacio libre por conexión (texto ya formateado), si el backend lo soporta.
+    private var aboutCache: [String: String] = [:]
+    func freeSpace(_ name: String) -> String? { aboutCache[name] }
+
     let rclonePath: String = {
         for c in ["/opt/homebrew/bin/rclone", "/usr/local/bin/rclone"]
             where FileManager.default.isExecutableFile(atPath: c) { return c }
@@ -276,6 +287,7 @@ final class RcloneManager {
         do {
             try process.run()
             mountProcesses[name] = process
+            desiredMounted.insert(name)
             inProgress.insert(name)
             onChange?()
             // Esperar a que el volumen aparezca (NFS tarda un par de segundos).
@@ -290,17 +302,65 @@ final class RcloneManager {
             guard let self else { return }
             if self.isMounted(name) {
                 self.inProgress.remove(name)
+                self.established.insert(name)
+                self.retryCount[name] = 0
                 self.onChange?()
                 self.notify("Mounted", "\(name) is available in Finder")
+                self.fetchAbout(name)
             } else if attempt < 12 && self.mountProcesses[name] != nil {
                 self.pollUntilMounted(name, attempt: attempt + 1)
             } else {
-                // No se montó: el proceso murió o agotó el tiempo. Mostrar el motivo.
                 self.inProgress.remove(name)
                 self.onChange?()
-                let reason = self.lastLogError(name) ?? "Check the log for details."
-                self.notify("Couldn’t mount \(name)", reason)
+                if self.established.contains(name) {
+                    // Era un reintento tras caída; el watchdog decide si insiste o se rinde.
+                } else {
+                    // Fallo de montaje inicial (credenciales/red): avisar y no reintentar.
+                    self.desiredMounted.remove(name)
+                    let reason = self.lastLogError(name) ?? "Check the log for details."
+                    self.notify("Couldn’t mount \(name)", reason)
+                }
             }
+        }
+    }
+
+    /// Reintenta en segundo plano las conexiones que se cayeron (el proceso rclone murió),
+    /// sin tocar las que el usuario desmontó a propósito ni las que fallaron al inicio.
+    func startWatchdog() {
+        watchdog?.invalidate()
+        watchdog = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            self?.watchdogTick()
+        }
+    }
+
+    private func watchdogTick() {
+        for name in desiredMounted {
+            let alive = mountProcesses[name]?.isRunning == true
+            if alive { retryCount[name] = 0; continue }
+            if isBusy(name) || !established.contains(name) { continue }
+
+            let n = (retryCount[name] ?? 0) + 1
+            if n > 5 {
+                desiredMounted.remove(name); established.remove(name); retryCount[name] = nil
+                notify("Connection lost", "\(name) couldn’t be remounted after several tries.")
+                continue
+            }
+            retryCount[name] = n
+            _ = runCapturing(executable: "/sbin/umount", args: ["-f", mountPoint(for: name).path])
+            mount(name)
+        }
+    }
+
+    /// Consulta el espacio libre del backend (si lo soporta) y lo cachea para el menú.
+    private func fetchAbout(_ name: String) {
+        DispatchQueue.global().async { [weak self] in
+            guard let self else { return }
+            let (out, code) = self.runCapturingWithStatus(args: ["about", "\(name):", "--json"], timeout: 15)
+            guard code == 0, let out, let data = out.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let free = json["free"] as? Double else { return }
+            let text = ByteCountFormatter.string(fromByteCount: Int64(free), countStyle: .file) + " free"
+            DispatchQueue.main.async { self.aboutCache[name] = text; self.onChange?() }
         }
     }
 
@@ -311,6 +371,11 @@ final class RcloneManager {
         if let p = mountProcesses[name], p.isRunning { p.terminate() }
         mountProcesses[name] = nil
         inProgress.remove(name)
+        // Desmontaje intencional: dejar de vigilar/reintentar esta conexión.
+        desiredMounted.remove(name)
+        established.remove(name)
+        retryCount[name] = nil
+        aboutCache[name] = nil
         onChange?()
         notify("Unmounted", "\(name) was unmounted")
     }
