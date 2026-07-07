@@ -68,18 +68,30 @@ final class RcloneManager {
         }.sorted { $0.name.lowercased() < $1.name.lowercased() }
     }
 
-    private func mountedPaths() -> Set<String> {
-        guard let out = runCapturing(executable: "/sbin/mount", args: []) else { return [] }
+    /// Rutas de montaje del sistema vía getmntinfo(3): sin lanzar procesos y sin
+    /// bloquear aunque haya un NFS colgado (MNT_NOWAIT usa datos cacheados).
+    func mountedPaths() -> Set<String> {
+        var mounts: UnsafeMutablePointer<statfs>?
+        let count = getmntinfo(&mounts, MNT_NOWAIT)
+        guard count > 0, let mounts else { return [] }
         var paths = Set<String>()
-        for line in out.split(separator: "\n") {
-            if let r = line.range(of: " on "),
-               let p = line.range(of: " (", range: r.upperBound..<line.endIndex) {
-                paths.insert(String(line[r.upperBound..<p.lowerBound]))
+        for i in 0..<Int(count) {
+            let path = withUnsafeBytes(of: mounts[i].f_mntonname) { raw in
+                String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
             }
+            paths.insert(path)
         }
         return paths
     }
-    func isMounted(_ name: String) -> Bool { mountedPaths().contains(mountPoint(for: name).path) }
+    func isMounted(_ name: String) -> Bool { isMounted(name, in: mountedPaths()) }
+    func isMounted(_ name: String, in paths: Set<String>) -> Bool {
+        paths.contains(mountPoint(for: name).path)
+    }
+    /// true si hay algún volumen montado dentro de la carpeta de montajes.
+    var anyMounted: Bool {
+        let base = mountBase.path.hasSuffix("/") ? mountBase.path : mountBase.path + "/"
+        return mountedPaths().contains { $0.hasPrefix(base) }
+    }
     func isBusy(_ name: String) -> Bool { inProgress.contains(name) }
 
     // MARK: - Crear conexiones
@@ -269,13 +281,22 @@ final class RcloneManager {
         process.executableURL = URL(fileURLWithPath: rclonePath)
         process.arguments = ["nfsmount", "\(name):", point.path,
                              "--volname", name,
-                             "--vfs-cache-mode", "writes",
-                             "--dir-cache-time", "30s",
+                             // Finder hace muchas lecturas pequeñas (miniaturas, QuickLook,
+                             // .DS_Store): cachearlas en disco las hace instantáneas la 2ª vez.
+                             "--vfs-cache-mode", "full",
+                             "--vfs-cache-max-size", "5G",
+                             "--vfs-read-ahead", "128M",
+                             // Caché de directorios larga; en Drive/OneDrive el polling
+                             // detecta cambios remotos, así que no se queda obsoleta.
+                             "--dir-cache-time", "15m",
+                             "--poll-interval", "30s",
+                             "--attr-timeout", "5s",
+                             // Precarga el árbol de directorios al montar.
+                             "--vfs-refresh",
                              // Resiliencia ante redes intermitentes:
                              "--low-level-retries", "10",
                              "--contimeout", "15s",
-                             "--timeout", "30s",
-                             "--no-modtime"]
+                             "--timeout", "30s"]
         process.environment = childEnv()
         if let logHandle { process.standardOutput = logHandle; process.standardError = logHandle }
         process.terminationHandler = { [weak self] _ in
@@ -346,8 +367,15 @@ final class RcloneManager {
                 continue
             }
             retryCount[name] = n
-            _ = runCapturing(executable: "/sbin/umount", args: ["-f", mountPoint(for: name).path])
-            mount(name)
+            inProgress.insert(name)   // evita que el siguiente tick lo procese de nuevo
+            let path = mountPoint(for: name).path
+            DispatchQueue.global().async { [weak self] in
+                _ = self?.runCapturing(executable: "/sbin/umount", args: ["-f", path], timeout: 10)
+                DispatchQueue.main.async {
+                    self?.inProgress.remove(name)
+                    self?.mount(name)
+                }
+            }
         }
     }
 
@@ -366,28 +394,54 @@ final class RcloneManager {
 
     func unmount(_ name: String) {
         let path = mountPoint(for: name).path
-        _ = runCapturing(executable: "/usr/sbin/diskutil", args: ["unmount", "force", path])
-        _ = runCapturing(executable: "/sbin/umount", args: ["-f", path])
-        if let p = mountProcesses[name], p.isRunning { p.terminate() }
-        mountProcesses[name] = nil
-        inProgress.remove(name)
+        let process = mountProcesses.removeValue(forKey: name)
         // Desmontaje intencional: dejar de vigilar/reintentar esta conexión.
         desiredMounted.remove(name)
         established.remove(name)
         retryCount[name] = nil
         aboutCache[name] = nil
+        inProgress.insert(name)
         onChange?()
-        notify("Unmounted", "\(name) was unmounted")
+        // diskutil/umount pueden tardar mucho si el servidor no responde
+        // (justo cuando más se usa Desmontar): nunca en el hilo de UI.
+        DispatchQueue.global().async { [weak self] in
+            guard let self else { return }
+            _ = self.runCapturing(executable: "/usr/sbin/diskutil",
+                                  args: ["unmount", "force", path], timeout: 15)
+            _ = self.runCapturing(executable: "/sbin/umount", args: ["-f", path], timeout: 10)
+            if let process, process.isRunning { process.terminate() }
+            DispatchQueue.main.async {
+                self.inProgress.remove(name)
+                self.onChange?()
+                self.notify("Unmounted", "\(name) was unmounted")
+            }
+        }
     }
 
     func unmountAll() { for n in Array(mountProcesses.keys) { unmount(n) } }
 
+    /// Desmontaje síncrono pero acotado en tiempo, solo para salir de la app
+    /// (el unmount normal es asíncrono y no llegaría a ejecutarse antes de terminar).
+    func unmountAllBeforeQuit() {
+        let names = Array(mountProcesses.keys)
+        for name in names {
+            if let p = mountProcesses[name], p.isRunning { p.terminate() }
+        }
+        for name in names {
+            _ = runCapturing(executable: "/sbin/umount",
+                             args: ["-f", mountPoint(for: name).path], timeout: 3)
+        }
+        mountProcesses.removeAll()
+    }
+
     func mountAll() {
-        for r in listRemotes() where !isMounted(r.name) && !isBusy(r.name) { mount(r.name) }
+        let mounted = mountedPaths()
+        for r in listRemotes() where !isMounted(r.name, in: mounted) && !isBusy(r.name) { mount(r.name) }
     }
 
     func mountAutoMounts() {
-        for name in Settings.shared.autoMountNames where !isMounted(name) { mount(name) }
+        let mounted = mountedPaths()
+        for name in Settings.shared.autoMountNames where !isMounted(name, in: mounted) { mount(name) }
     }
 
     /// Extrae un mensaje de error legible de la última línea CRITICAL/ERROR del log.
@@ -434,8 +488,9 @@ final class RcloneManager {
         return env
     }
 
-    private func runCapturing(executable: String? = nil, args: [String]) -> String? {
-        runCapturingWithStatus(executable: executable, args: args).0
+    private func runCapturing(executable: String? = nil, args: [String],
+                              timeout: TimeInterval = 30) -> String? {
+        runCapturingWithStatus(executable: executable, args: args, timeout: timeout).0
     }
 
     @discardableResult
@@ -454,8 +509,15 @@ final class RcloneManager {
         } catch {
             return ("couldn’t run rclone: \(error.localizedDescription)", -1)
         }
+        // Si el proceso excede el tiempo, se termina: la lectura del pipe devuelve
+        // lo acumulado hasta entonces y waitUntilExit no queda bloqueado para siempre.
+        let killer = DispatchWorkItem {
+            if process.isRunning { process.terminate() }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        killer.cancel()
         return (String(data: data, encoding: .utf8), process.terminationStatus)
     }
 }

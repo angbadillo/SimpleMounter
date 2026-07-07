@@ -5,6 +5,10 @@ struct PreferencesView: View {
     let manager: RcloneManager
     var onChanged: () -> Void
 
+    /// Versión del Info.plist ("0.mesdía", la genera package.sh con la fecha de build).
+    private static let appVersion =
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0707"
+
     @ObservedObject private var settings = Settings.shared
     @State private var launchAtLogin = Settings.shared.launchAtLogin
     @State private var remotes: [Remote] = []
@@ -34,9 +38,15 @@ struct PreferencesView: View {
                     ForEach(remotes) { connectionRow($0) }
                 }
             }
+
+            Section("About") {
+                LabeledContent("Version", value: Self.appVersion)
+                Text("Freeware · © 2026 Buscarruidos")
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
-        .frame(width: 480, height: 460)
+        .frame(width: 480, height: 520)
         .onAppear { remotes = manager.listRemotes() }
         .sheet(item: $editing) { r in
             EditConnectionView(manager: manager, original: r) {
@@ -51,7 +61,7 @@ struct PreferencesView: View {
     private func connectionRow(_ r: Remote) -> some View {
         HStack(spacing: 10) {
             Image(systemName: Theme.symbolName(for: r.type))
-                .foregroundColor(Color(nsColor: Theme.accentNS(for: r.name)))
+                .foregroundColor(Theme.tint(for: r.type))
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 1) {
                 Text(r.name)

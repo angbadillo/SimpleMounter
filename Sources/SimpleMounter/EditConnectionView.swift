@@ -31,7 +31,7 @@ struct EditConnectionView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
                 Image(systemName: Theme.symbolName(for: original.type))
-                    .foregroundColor(Color(nsColor: Theme.accentNS(for: original.name)))
+                    .foregroundColor(Theme.tint(for: original.type))
                 Text("Edit connection").font(.system(size: 16, weight: .medium))
                 Spacer()
                 Text(original.prettyType).font(.system(size: 12)).foregroundColor(.secondary)

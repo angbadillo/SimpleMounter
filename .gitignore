@@ -9,3 +9,6 @@ AppIcon.iconset/
 
 # macOS
 .DS_Store
+
+# Packaged distribution
+SimpleMounter.zip

@@ -37,8 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Ícono azul celeste; cambia a relleno cuando hay algo montado.
     private func refreshStatusIcon() {
         guard let button = statusItem?.button else { return }
-        let anyMounted = !rclone.listRemotes().filter { rclone.isMounted($0.name) }.isEmpty
-        let symbol = anyMounted ? "externaldrive.connected.to.line.below.fill"
+        let symbol = rclone.anyMounted ? "externaldrive.connected.to.line.below.fill"
                                 : "externaldrive.connected.to.line.below"
         let config = NSImage.SymbolConfiguration(paletteColors: [Theme.skyBlueNS])
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "SimpleMounter")?
@@ -53,7 +52,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
 
         let remotes = rclone.listRemotes()
-        let mountedCount = remotes.filter { rclone.isMounted($0.name) }.count
+        let mountedPaths = rclone.mountedPaths()   // una sola consulta para todo el menú
+        let mountedCount = remotes.filter { rclone.isMounted($0.name, in: mountedPaths) }.count
 
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
         let title = "SimpleMounter \(version)" + (mountedCount > 0 ? " — \(mountedCount) mounted" : "")
@@ -73,8 +73,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             empty.isEnabled = false
             menu.addItem(empty)
         } else {
-            for r in remotes { menu.addItem(remoteItem(r)) }
-            let unmounted = remotes.filter { !rclone.isMounted($0.name) }.count
+            for r in remotes { menu.addItem(remoteItem(r, mountedPaths: mountedPaths)) }
+            let unmounted = remotes.count - mountedCount
             if remotes.count > 1 {
                 menu.addItem(.separator())
                 if unmounted > 0 { addItem(to: menu, "Mount all", #selector(mountAll), symbol: "arrow.down.circle") }
@@ -90,16 +90,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addItem(to: menu, "Quit", #selector(quit), key: "q")
     }
 
-    private func remoteItem(_ r: Remote) -> NSMenuItem {
-        let mounted = rclone.isMounted(r.name)
+    private func remoteItem(_ r: Remote, mountedPaths: Set<String>) -> NSMenuItem {
+        let mounted = rclone.isMounted(r.name, in: mountedPaths)
         let busy = rclone.isBusy(r.name)
         var status: String = busy ? "connecting…" : (mounted ? rclone.mountPoint(for: r.name).path : "not mounted")
         if mounted, let free = rclone.freeSpace(r.name) { status += " · \(free)" }
 
         let item = NSMenuItem()
         item.attributedTitle = twoLineTitle(name: r.name, subtitle: "\(r.prettyType) · \(status)")
+        // Color por tipo de servicio; atenuado si no está montado.
+        let tint = Theme.tintNS(for: r.type)
         item.image = tintedSymbol(Theme.symbolName(for: r.type),
-                                  color: mounted ? .systemGreen : Theme.accentNS(for: r.name))
+                                  color: mounted ? tint : tint.withAlphaComponent(0.45))
 
         let sub = NSMenu()
         if busy {
@@ -263,7 +265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.makeKeyAndOrderFront(nil)
     }
 
-    @objc private func quit() { rclone.unmountAll(); NSApp.terminate(nil) }
+    @objc private func quit() { rclone.unmountAllBeforeQuit(); NSApp.terminate(nil) }
 
     /// Menú principal mínimo. En apps de barra de menú (.accessory) no se muestra,
     /// pero sus atajos (⌘X/⌘C/⌘V/⌘A) sí se enrutan a los campos de texto enfocados.

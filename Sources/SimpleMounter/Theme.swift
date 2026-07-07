@@ -18,15 +18,17 @@ enum Theme {
         }
     }
 
-    /// Color estable derivado del nombre, para distinguir cuentas del mismo tipo.
-    static func accentNS(for name: String) -> NSColor {
-        let palette: [NSColor] = [
-            skyBlueNS,
-            NSColor.systemTeal, NSColor.systemIndigo, NSColor.systemPurple,
-            NSColor.systemPink, NSColor.systemOrange, NSColor.systemGreen
-        ]
-        // Hash determinista (estable entre ejecuciones).
-        let sum = name.unicodeScalars.reduce(0) { $0 &+ Int($1.value) }
-        return palette[sum % palette.count]
+    /// Color por tipo de servicio: identifica el servicio de un vistazo.
+    static func tintNS(for type: String) -> NSColor {
+        switch type {
+        case "onedrive": // azul oscuro
+            return NSColor(srgbRed: 0x1A/255.0, green: 0x5F/255.0, blue: 0xB4/255.0, alpha: 1)
+        case "drive":    // amarillo-anaranjado
+            return NSColor(srgbRed: 0xF5/255.0, green: 0xA6/255.0, blue: 0x23/255.0, alpha: 1)
+        case "ftp":      return .systemRed
+        case "sftp":     return .systemTeal
+        default:         return skyBlueNS
+        }
     }
+    static func tint(for type: String) -> Color { Color(nsColor: tintNS(for: type)) }
 }
