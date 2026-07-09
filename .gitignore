@@ -12,3 +12,4 @@ AppIcon.iconset/
 
 # Packaged distribution
 SimpleMounter.zip
+*.dmg

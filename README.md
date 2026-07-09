@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="icon.png" width="128" alt="SimpleMounter icon">
+</p>
+
 # SimpleMounter
 
 A lightweight macOS menu-bar app to mount **SFTP, FTP/FTPS, OneDrive and Google Drive**
