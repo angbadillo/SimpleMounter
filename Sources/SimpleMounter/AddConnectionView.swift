@@ -123,7 +123,7 @@ struct AddConnectionView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            Label("rclone stores credentials encrypted in ~/.config/rclone.",
+            Label("Credentials are stored in rclone’s config, readable only by your user.",
                   systemImage: "lock.shield")
                 .font(.system(size: 11)).foregroundStyle(.secondary)
 

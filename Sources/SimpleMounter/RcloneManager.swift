@@ -96,32 +96,105 @@ final class RcloneManager {
 
     // MARK: - Crear conexiones
 
-    /// Crea un remote SFTP/FTP de forma directa (rclone ofusca la contraseña).
+    /// Rechaza nombres/hosts peligrosos: un nombre con "/" o ".." acabaría montando
+    /// (y desmontando con -f) fuera de la carpeta de montajes, y un host que empiece
+    /// por "-" se interpretaría como opción en ssh-keyscan.
+    private func validate(name: String, host: String? = nil) -> String? {
+        if name.isEmpty { return "The name can’t be empty." }
+        if name.contains("/") || name.contains("..")
+            || name.hasPrefix(".") || name.hasPrefix("-") {
+            return "The name can’t contain “/” or “..”, or start with “.” or “-”."
+        }
+        if let host, host.hasPrefix("-") { return "Invalid host." }
+        return nil
+    }
+
+    /// Crea un remote SFTP/FTP. La contraseña nunca viaja como argumento de proceso
+    /// (los argumentos son visibles en `ps`): se guarda aparte vía storePassword.
     @discardableResult
     func createBasic(name: String, type: String, host: String, user: String,
                      port: String, password: String,
                      extra: [String: String] = [:]) -> (ok: Bool, error: String?) {
-        var args = ["config", "create", name, type, "host=\(host)", "user=\(user)"]
+        if let err = validate(name: name, host: host) { return (false, err) }
+        var args = ["config", "create", name, type, "--non-interactive",
+                    "host=\(host)", "user=\(user)"]
         if !port.isEmpty { args.append("port=\(port)") }
-        if !password.isEmpty { args.append("pass=\(password)") }
         for (k, v) in extra { args.append("\(k)=\(v)") }
         let (out, code) = runCapturingWithStatus(args: args)
-        let ok = code == 0
-        if ok {
-            onChange?()
-            // SFTP nace seguro: fijamos la clave del host en segundo plano (sin bloquear la UI).
-            if type == "sftp" {
-                DispatchQueue.global().async { [weak self] in self?.pinHostKey(name: name, host: host, port: port) }
+        guard code == 0 else { return (false, out) }
+        if !password.isEmpty {
+            let r = storePassword(password, remote: name)
+            if !r.ok {   // sin contraseña la conexión no sirve: no dejar un remote a medias
+                _ = runCapturing(args: ["config", "delete", name])
+                return r
             }
         }
-        return (ok, ok ? nil : out)
+        onChange?()
+        // SFTP nace seguro: fijamos la clave del host en segundo plano (sin bloquear la UI).
+        if type == "sftp" {
+            DispatchQueue.global().async { [weak self] in self?.pinHostKey(name: name, host: host, port: port) }
+        }
+        return (true, nil)
+    }
+
+    // MARK: - Secretos (nunca por argumentos de proceso)
+
+    /// Ruta del rclone.conf tal y como la reporta el propio rclone (cacheada).
+    private lazy var configPath: String? = {
+        guard let out = runCapturing(args: ["config", "file"]) else { return nil }
+        return out.split(separator: "\n").map(String.init).last(where: { $0.hasPrefix("/") })
+    }()
+
+    /// Ofusca un secreto con `rclone obscure` pasándolo por stdin.
+    private func obscure(_ secret: String) -> String? {
+        let (out, code) = runCapturingWithStatus(args: ["obscure", "-"], stdin: secret)
+        guard code == 0, let out else { return nil }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Guarda la contraseña (ofuscada) escribiéndola directamente en rclone.conf.
+    private func storePassword(_ password: String, remote: String) -> (ok: Bool, error: String?) {
+        editConfig("Couldn’t store the password.") { text in
+            guard let obscured = self.obscure(password) else { return nil }
+            return ConfigFile.settingValue("pass", obscured, remote: remote, in: text)
+        }
+    }
+
+    /// Renombra la sección del remote en rclone.conf conservando todos sus campos
+    /// (incluidos contraseña y token OAuth) sin que pasen por argumentos.
+    private func renameInConfig(_ old: String, to new: String) -> (ok: Bool, error: String?) {
+        editConfig("Couldn’t rename the connection.") { text in
+            ConfigFile.renamingSection(old, to: new, in: text)
+        }
+    }
+
+    /// Lee rclone.conf, aplica una transformación y lo reescribe (0600).
+    private func editConfig(_ failureMessage: String,
+                            _ transform: (String) -> String?) -> (ok: Bool, error: String?) {
+        guard let path = configPath,
+              let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return (false, "Couldn’t read the rclone config file.")
+        }
+        guard !ConfigFile.isEncrypted(text) else {
+            return (false, "Encrypted rclone configs aren’t supported.")
+        }
+        guard let updated = transform(text) else { return (false, failureMessage) }
+        do {
+            try updated.write(toFile: path, atomically: true, encoding: .utf8)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+            return (true, nil)
+        } catch {
+            return (false, error.localizedDescription)
+        }
     }
 
     /// Crea un remote OAuth (Drive/OneDrive) lanzando el flujo de navegador de rclone.
     func createOAuth(name: String, type: String, completion: @escaping (Bool, String?) -> Void) {
+        if let err = validate(name: name) { completion(false, err); return }
         inProgress.insert(name)
         onChange?()
-        runOAuth(args: ["config", "create", name, type], name: name, completion: completion)
+        runOAuth(args: ["config", "create", name, type], name: name,
+                 deleteOnFailure: true, completion: completion)
     }
 
     /// Re-autoriza un remote OAuth existente (token caducado).
@@ -131,12 +204,16 @@ final class RcloneManager {
         runOAuth(args: ["config", "reconnect", "\(name):"], name: name, completion: completion)
     }
 
-    private func runOAuth(args: [String], name: String, completion: @escaping (Bool, String?) -> Void) {
+    private func runOAuth(args: [String], name: String, deleteOnFailure: Bool = false,
+                          completion: @escaping (Bool, String?) -> Void) {
         DispatchQueue.global().async {
-            let (out, code) = self.runCapturingWithStatus(args: args, timeout: 180)
+            // 5 min: autorizar en el navegador puede llevar un rato.
+            let (out, code) = self.runCapturingWithStatus(args: args, timeout: 300)
+            let ok = code == 0
+            // Si la autorización falló a medias, no dejar un remote fantasma sin token.
+            if !ok && deleteOnFailure { _ = self.runCapturing(args: ["config", "delete", name]) }
             DispatchQueue.main.async {
                 self.inProgress.remove(name)
-                let ok = code == 0
                 self.onChange?()
                 completion(ok, ok ? nil : out)
             }
@@ -153,6 +230,7 @@ final class RcloneManager {
     /// Descarga la clave pública del host (ssh-keyscan) y la fija en known_hosts del remote.
     /// TOFU: confía en la clave en el primer uso; protege de MITM en adelante.
     private func pinHostKey(name: String, host: String, port: String) {
+        guard !host.isEmpty, !host.hasPrefix("-") else { return }   // no inyectable como opción
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/rclone", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -206,68 +284,61 @@ final class RcloneManager {
                   port: String, newPassword: String,
                   extra: [String: String] = [:]) -> (ok: Bool, error: String?) {
         let newName = newName.trimmingCharacters(in: .whitespaces)
-        guard !newName.isEmpty else { return (false, "The name can’t be empty.") }
-        let renaming = newName != original.name
-        if renaming && listRemotes().contains(where: { $0.name == newName }) {
-            return (false, "A connection named “\(newName)” already exists.")
+        if let err = validate(name: newName, host: original.isOAuth ? nil : host) {
+            return (false, err)
         }
+        let oldHost = original.isOAuth ? "" : (configFields(original.name)["host"] ?? "")
 
-        if original.isOAuth {
-            return renaming ? renameCopy(original.name, to: newName) : (true, nil)
-        }
-
-        // SFTP / FTP
-        if renaming {
-            var args = ["config", "create", newName, original.type, "--non-interactive",
-                        "host=\(host)", "user=\(user)", "port=\(port)"]
-            for (k, v) in extra { args.append("\(k)=\(v)") }
-            if !newPassword.isEmpty {
-                args.append("pass=\(newPassword)")
-            } else if let p = configFields(original.name)["pass"], !p.isEmpty {
-                args.append("--no-obscure"); args.append("pass=\(p)")
+        if newName != original.name {
+            if listRemotes().contains(where: { $0.name == newName }) {
+                return (false, "A connection named “\(newName)” already exists.")
             }
-            let (out, code) = runCapturingWithStatus(args: args)
-            if code != 0 { return (false, out) }
-            migrateAndDelete(original.name, to: newName)
-            return (true, nil)
-        } else {
-            var args = ["config", "update", original.name,
+            if isMounted(original.name) { unmount(original.name) }
+            // Renombrar la sección directamente en el conf conserva todos los campos
+            // (contraseña, token OAuth…) sin exponerlos como argumentos de proceso.
+            let r = renameInConfig(original.name, to: newName)
+            if !r.ok { return r }
+            let wasAuto = Settings.shared.autoMountNames.contains(original.name)
+            Settings.shared.toggleAutoMount(original.name, on: false)
+            if wasAuto { Settings.shared.toggleAutoMount(newName, on: true) }
+        }
+
+        if !original.isOAuth {
+            var args = ["config", "update", newName,
                         "host=\(host)", "user=\(user)", "port=\(port)"]
             for (k, v) in extra { args.append("\(k)=\(v)") }
-            if !newPassword.isEmpty { args.append("pass=\(newPassword)") }
             let (out, code) = runCapturingWithStatus(args: args)
             if code != 0 { return (false, out) }
-            onChange?()
-            return (true, nil)
+            if !newPassword.isEmpty {
+                let r = storePassword(newPassword, remote: newName)
+                if !r.ok { return r }
+            }
+            // Si cambió el host de un SFTP, la clave fijada es la del host antiguo:
+            // re-fijar la nueva en segundo plano para que el montaje no falle.
+            if original.type == "sftp" && host != oldHost {
+                DispatchQueue.global().async { [weak self] in
+                    self?.pinHostKey(name: newName, host: host, port: port)
+                }
+            }
         }
-    }
-
-    /// Copia un remote (todos sus campos, sin re-cifrar) con otro nombre y borra el viejo.
-    private func renameCopy(_ old: String, to new: String) -> (ok: Bool, error: String?) {
-        let fields = configFields(old)
-        guard let type = fields["type"] else { return (false, "Unknown type.") }
-        var args = ["config", "create", new, type, "--non-interactive", "--no-obscure"]
-        for (k, v) in fields where k != "type" { args.append("\(k)=\(v)") }
-        let (out, code) = runCapturingWithStatus(args: args)
-        if code != 0 { return (false, out) }
-        migrateAndDelete(old, to: new)
-        return (true, nil)
-    }
-
-    /// Traslada montaje/automontaje del nombre viejo al nuevo y elimina el viejo.
-    private func migrateAndDelete(_ old: String, to new: String) {
-        if isMounted(old) { unmount(old) }
-        let wasAuto = Settings.shared.autoMountNames.contains(old)
-        _ = runCapturing(args: ["config", "delete", old])
-        Settings.shared.toggleAutoMount(old, on: false)
-        if wasAuto { Settings.shared.toggleAutoMount(new, on: true) }
         onChange?()
+        return (true, nil)
     }
 
     // MARK: - Montar / Desmontar
 
     func mount(_ name: String) {
+        // Evitar montajes dobles: un segundo rclone sobre el mismo punto dejaría
+        // el proceso anterior huérfano y sin supervisión.
+        guard mountProcesses[name] == nil, !inProgress.contains(name) else { return }
         let point = mountPoint(for: name)
+        // El punto debe quedar dentro de la carpeta de montajes (un nombre tipo ".."
+        // apuntaría fuera y el desmontaje con -f sería peligroso).
+        guard point.standardizedFileURL.path
+            .hasPrefix(mountBase.standardizedFileURL.path + "/") else {
+            notify("Couldn’t mount \(name)", "Invalid mount location.")
+            return
+        }
         try? FileManager.default.createDirectory(at: point, withIntermediateDirectories: true)
 
         let logDir = FileManager.default.homeDirectoryForCurrentUser
@@ -354,7 +425,17 @@ final class RcloneManager {
         }
     }
 
+    private var watchdogTicks = 0
+
     private func watchdogTick() {
+        watchdogTicks += 1
+        // Cada ~1 min, refrescar el espacio libre de lo montado (antes solo se
+        // consultaba al montar y el dato del menú quedaba congelado).
+        if watchdogTicks % 4 == 0 {
+            for name in established where mountProcesses[name]?.isRunning == true {
+                fetchAbout(name)
+            }
+        }
         for name in desiredMounted {
             let alive = mountProcesses[name]?.isRunning == true
             if alive { retryCount[name] = 0; continue }
@@ -495,6 +576,7 @@ final class RcloneManager {
 
     @discardableResult
     private func runCapturingWithStatus(executable: String? = nil, args: [String],
+                                        stdin: String? = nil,
                                         timeout: TimeInterval = 30) -> (String?, Int32) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable ?? rclonePath)
@@ -503,16 +585,31 @@ final class RcloneManager {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
-        process.standardInput = FileHandle.nullDevice
+        // stdin permite pasar secretos sin exponerlos como argumentos (ps).
+        let inPipe: Pipe?
+        if stdin != nil {
+            let p = Pipe(); process.standardInput = p; inPipe = p
+        } else {
+            process.standardInput = FileHandle.nullDevice; inPipe = nil
+        }
         do {
             try process.run()
         } catch {
             return ("couldn’t run rclone: \(error.localizedDescription)", -1)
         }
-        // Si el proceso excede el tiempo, se termina: la lectura del pipe devuelve
-        // lo acumulado hasta entonces y waitUntilExit no queda bloqueado para siempre.
+        if let stdin, let inPipe {
+            inPipe.fileHandleForWriting.write(Data(stdin.utf8))
+            try? inPipe.fileHandleForWriting.close()
+        }
+        // Si el proceso excede el tiempo, se termina (y se mata si ignora SIGTERM):
+        // la lectura del pipe devuelve lo acumulado y waitUntilExit no queda
+        // bloqueado para siempre.
         let killer = DispatchWorkItem {
-            if process.isRunning { process.terminate() }
+            guard process.isRunning else { return }
+            process.terminate()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
+                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            }
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
         let data = pipe.fileHandleForReading.readDataToEndOfFile()

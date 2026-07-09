@@ -46,8 +46,9 @@ A sky-blue drive icon appears in the menu bar.
 
 ## Notes
 - Per-mount logs live at `~/Library/Logs/SimpleMounter/<name>.log`.
-- Credentials and OAuth tokens are stored and encrypted by rclone in
-  `~/.config/rclone/rclone.conf` — not by this app.
+- Credentials and OAuth tokens are stored by rclone in `~/.config/rclone/rclone.conf`
+  (obscured, and readable only by your user) — not by this app. SimpleMounter never
+  passes secrets as process arguments, so they can't be snooped via `ps`.
 - The read cache lives in `~/Library/Caches/rclone` (capped at 5 GB per mount).
 - Changes made from another machine can take up to ~30 s to appear on Drive/OneDrive
   (change polling) and up to 15 min on SFTP/FTP (directory cache lifetime).
