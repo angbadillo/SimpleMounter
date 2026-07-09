@@ -1,6 +1,9 @@
 <p align="center">
   <img src="icon.png" width="128" alt="SimpleMounter icon">
 </p>
+<p align="center">
+  <a href="https://github.com/angbadillo/SimpleMounter/releases/latest"><b>⬇︎&nbsp;Download for macOS (.dmg)</b></a>
+</p>
 
 # SimpleMounter
 
